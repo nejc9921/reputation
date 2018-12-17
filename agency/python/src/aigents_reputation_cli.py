@@ -67,24 +67,10 @@ class AigentsCLIReputationService(RatingService,RankingService):
 		res = self.ai_command('clear ratings')
 		return 0 if len(res.strip()) == 0 else 1
 
-	"""
-	Add ratings as list of dicts containing "from","type","to","value","weight","time" ("weight" may be None)
-	0 - success
-	1 - unknown error
-	"""
-	def put_ratings(self,ratings):
-		cmd = 'add ratings '
-		for rating in ratings:
-			if self.verbose:
-				print( rating )
-			item = ' from ' + str(rating['from']) + ' type ' + rating['type'] + ' to ' + str(rating['to']) +\
-					' value ' + str(rating['value']) + (str(rating['weight']) if rating['weight'] is not None else '') + ' time ' + str(rating['time'])
-			cmd += item
-		res = self.ai_command(cmd)
-		return 0 if len(res.strip()) == 0 else 1
+	def put_ratings(self):
+		return("put_ratings")
 
 	def get_ratings(self):
-		#TODO
 		return("get_ratings")
 
 	"""
@@ -96,7 +82,7 @@ class AigentsCLIReputationService(RatingService,RankingService):
 		res = self.ai_command('clear ranks')
 		return 0 if len(res.strip()) == 0 else 1
 
-	def put_ranks(self,ranks):
+	def put_ranks(self):
 		return("put_ranks")
 
 	def get_ranks(self):

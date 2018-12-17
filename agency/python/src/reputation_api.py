@@ -31,11 +31,8 @@ Reputation Rating Service interface definition
 """        
 class RatingService(abc.ABC):
 
-	"""
-	List of dicts with the key-value pairs for the attributes: "from","type","to","value","weight","time"
-	"""
 	@abc.abstractmethod
-	def put_ratings(self,ratings):
+	def put_ratings(self):
 		pass
         
 	@abc.abstractmethod
@@ -55,7 +52,7 @@ class RankingService(abc.ABC):
 		pass
 
 	@abc.abstractmethod
-	def put_ranks(self,ranks):
+	def put_ranks(self):
 		pass
 
 	@abc.abstractmethod
@@ -65,6 +62,35 @@ class RankingService(abc.ABC):
 	@abc.abstractmethod
 	def clear_ranks(self):
 		pass
+
+
+#TODO @anton take this out to separate file and implement
+
+"""
+Reputation Service wrapper around Aigents Java-based implementation
+"""        
+class AigentsReputationService(RatingService,RankingService):
+
+	def clear_ratings(self):
+		return("clear_ratings")
+
+	def put_ratings(self):
+		return("put_ratings")
+
+	def get_ratings(self):
+		return("get_ratings")
+
+	def clear_ranks(self):
+		return("clear_ranks")
+
+	def put_ranks(self):
+		return("put_ranks")
+
+	def get_ranks(self):
+		return("get_ranks")
+
+	def update_ranks(self):
+		return("update_ranks")
 
 
 #TODO @neic take this out to separate file and implement
