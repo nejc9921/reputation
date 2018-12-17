@@ -24,16 +24,21 @@
 
 import unittest
 import datetime
-import time
 import logging
 
 from aigents_reputation_cli import *
 from aigents_reputation_api import *
 
 # Uncomment this for logging to console
-#logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
+logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
 
-class TestReputationServiceBase(object):
+class TestReputationServiceMethods(unittest.TestCase):
+
+	def setUp(self):
+		# Command-line-based Aigents Reputation Service wrapper 
+		#self.rs = AigentsCLIReputationService('../../bin','./','test',True)
+		# Web-service-based Aigents Reputation Service wrapper 
+		self.rs = AigentsAPIReputationService('http://localtest.com:1180/', 'john@doe.org', 'q', 'a', False, 'test', True)
 
 	def test_smoke(self):
 		rs = self.rs
@@ -41,7 +46,7 @@ class TestReputationServiceBase(object):
 		#check default parameters
 		p = rs.get_parameters()
 		self.assertEqual( p['default'], 0.5 )
-		self.assertEqual( p['conservatism'], 0.5)
+		self.assertEqual( p['concervatizm'], 0.5)
 		self.assertEqual( p['precision'], 0.01)
 		self.assertEqual( p['weighting'], True)
 		self.assertEqual( p['fullnorm'], True)
@@ -116,6 +121,7 @@ class TestReputationServiceBase(object):
 				self.assertEqual(rank['rank'], 33)			
 
 
+<<<<<<< HEAD
 # Test Command-line-based Aigents Reputation Service wrapper 
 class TestAigentsCLIReputationService(TestReputationServiceBase,unittest.TestCase):
 
@@ -199,6 +205,8 @@ class TestReputationSimulation(unittest.TestCase):
 		"""
 	
 
+=======
+>>>>>>> parent of 6ed08ab... Merge pull request #5 from singnet/master
 if __name__ == '__main__':
     unittest.main()
 
