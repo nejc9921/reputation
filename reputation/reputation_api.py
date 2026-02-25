@@ -202,26 +202,234 @@ class LiquidRankDataInitializer:
         df = self.parse_and_sort(df)
         df = self.apply_cutoff_date(df, cutoff_date=cutoff_date)
         df = self.apply_time_window_from_config(df)
+        df = self.enrich_initialized_frame(df)
         transactions = self.to_transactions(df)
 
         return {"df": df, "transactions": transactions}
+
+    # -----------------------------------------------------------------
+    # Next initialization steps: normalize_value, weight, tx metadata
+    # -----------------------------------------------------------------
+
+    def ensure_optional_columns(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Ensure optional columns exist so downstream logic can rely on them.
+        This does not overwrite existing values.
+        """
+        out = df.copy()
+
+        if "transactionID" not in out.columns:
+            # Deterministic fallback ID (stable given the sort)
+            out["transactionID"] = np.arange(len(out), dtype=np.int64)
+
+        if "transaction_type" not in out.columns:
+            out["transaction_type"] = "transfer"
+
+        return out
+
+    def add_normalized_value(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Ensures 'normalized_value' exists and is in [0, 1].
+        Default implementation: min-max normalize 'value'.
+        """
+        out = df.copy()
+
+        if "normalized_value" in out.columns:
+            # Validate/clean a bit (do not hard-fail unless NaNs)
+            nv = pd.to_numeric(out["normalized_value"], errors="coerce")
+            if nv.isna().any():
+                bad = out.loc[nv.isna(), "normalized_value"].head(5).tolist()
+                raise ValueError(f"'normalized_value' contains non-numeric values. Examples: {bad}")
+            ## out["normalized_value"] = nv.clip(lower=0.0, upper=1.0)
+            return raise ValueError(f"'Normalized values are above 1 or below 0.")
+
+        v = pd.to_numeric(out[self.value_col], errors="coerce")
+        if v.isna().any():
+            bad = out.loc[v.isna(), self.value_col].head(5).tolist()
+            raise ValueError(f"'{self.value_col}' contains non-numeric values. Examples: {bad}")
+
+        vmin = float(v.min())
+        vmax = float(v.max())
+        denom = vmax - vmin
+
+        if denom <= self.cfg.epsilon:
+            # All values identical (or effectively so) => uniform normalized_value
+            out["normalized_value"] = 1.0
+        else:
+            out["normalized_value"] = ((v - vmin) / denom).astype(float)
+
+        return out
+
+    def add_weight(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Ensures 'weight' exists.
+        Default: weight = normalized_value * scale.
+        """
+        out = df.copy()
+
+        if "weight" in out.columns:
+            w = pd.to_numeric(out["weight"], errors="coerce")
+            if w.isna().any():
+                bad = out.loc[w.isna(), "weight"].head(5).tolist()
+                raise ValueError(f"'weight' contains non-numeric values. Examples: {bad}")
+            out["weight"] = w.astype(float)
+            return out
+
+        if "normalized_value" not in out.columns:
+            raise KeyError("Missing 'normalized_value'. Call add_normalized_value() first.")
+
+        out["weight"] = out["normalized_value"].astype(float) * float(self.cfg.scale)
+        return out
+
+    def enrich_initialized_frame(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Runs the next initialization steps after parse/sort and time filtering:
+          - ensure optional metadata columns
+          - add normalized_value (if missing)
+          - add weight (if missing)
+          - apply weight_mode transform
+        """
+        out = self.ensure_optional_columns(df)
+        out = self.add_normalized_value(out)
+        out = self.add_weight(out)
+        return out
+
+
+
         
-"""
-Reputation Generic Service interface definition
-"""        
+
 class ReputationService(abc.ABC):
+    """
+    Concrete parameter store for Liquid Rank / reputation simulation.
 
-	"""
-	Input: dict of all parameters that needs to be set (not listed parameters are not affected)
-	Output: 0 on success, integer error code on error 
-	"""
-	@abc.abstractmethod
-	def set_parameters(self,parameters):
-		pass
+    This class *only* manages parameters and defaults for now.
+    """
 
-	@abc.abstractmethod
-	def get_parameters(self):
-		pass
+    # Error codes
+    ERR_NOT_A_DICT = 1
+    ERR_UNKNOWN_KEY = 2
+    ERR_INVALID_TYPE = 3
+    ERR_INVALID_VALUE = 4
+
+    def __init__(self) -> None:
+        # Canonical parameter set with defaults
+        self._params: Dict[str, Any] = {
+            # Core
+            "default_reputation": 0.5,
+            "conservatism": 0.1,     # matches your example (conservativity=0.1)
+            "precision": 1,
+
+            # reputation_calc_p1 flags
+            "temporal_aggregation": False,
+            "need_occurance": False,
+            "logratings": False,
+            "downrating": False,
+            "weighting": True,
+            "rater_bias": None,
+            "averages": None,
+
+            # calculate_new_reputation flags
+            "rating": True,
+            "unrated": False,
+            "normalizedRanks": True,
+            "denomination": True,
+            "liquid": False,
+            "logranks": True,
+
+            # predictive settings
+            "predictiveness": 0,
+            "predictive_data": {},
+        }
+
+        # Define allowed keys once (prevents silent typos)
+        self._allowed_keys = set(self._params.keys())
+
+    def set_parameters(self, parameters: Dict[str, Any]) -> int:
+        """
+        Partial update: only keys present in `parameters` are updated.
+        Unknown keys are rejected with ERR_UNKNOWN_KEY.
+        """
+        if not isinstance(parameters, dict):
+            return self.ERR_NOT_A_DICT
+
+        # Reject unknown keys first (fail fast)
+        for k in parameters.keys():
+            if k not in self._allowed_keys:
+                return self.ERR_UNKNOWN_KEY
+
+        # Validate and apply
+        for k, v in parameters.items():
+            code = self._validate_one(k, v)
+            if code != 0:
+                return code
+            self._params[k] = v
+
+        return 0
+
+    def get_parameters(self) -> Dict[str, Any]:
+        """
+        Returns a defensive copy so callers cannot mutate internal state.
+        """
+        return deepcopy(self._params)
+
+    # -----------------------
+    # Validation
+    # -----------------------
+    def _validate_one(self, key: str, value: Any) -> int:
+        # Core numeric validations
+        if key == "default_reputation":
+            if not isinstance(value, (int, float)):
+                return self.ERR_INVALID_TYPE
+            if not (0.0 <= float(value) <= 1.0):
+                return self.ERR_INVALID_VALUE
+            return 0
+
+        if key == "conservatism":
+            if not isinstance(value, (int, float)):
+                return self.ERR_INVALID_TYPE
+            # allow 0..1 inclusive
+            if not (0.0 <= float(value) <= 1.0):
+                return self.ERR_INVALID_VALUE
+            return 0
+
+        if key == "precision":
+            if not isinstance(value, int):
+                return self.ERR_INVALID_TYPE
+            if value < 0:
+                return self.ERR_INVALID_VALUE
+            return 0
+
+        # Booleans
+        bool_keys = {
+            "temporal_aggregation", "need_occurance", "logratings", "downrating",
+            "weighting", "rating", "unrated", "normalizedRanks", "denomination",
+            "liquid", "logranks",
+        }
+        if key in bool_keys:
+            if not isinstance(value, bool):
+                return self.ERR_INVALID_TYPE
+            return 0
+
+        # Predictive settings
+        if key == "predictiveness":
+            if not isinstance(value, int):
+                return self.ERR_INVALID_TYPE
+            if value < 0:
+                return self.ERR_INVALID_VALUE
+            return 0
+
+        if key == "predictive_data":
+            if not isinstance(value, dict):
+                return self.ERR_INVALID_TYPE
+            return 0
+
+        # Optional passthroughs
+        if key in {"rater_bias", "averages"}:
+            # allow any object or None for now
+            return 0
+
+        # Should not happen because unknown keys rejected earlier
+        return self.ERR_UNKNOWN_KEY
 
 
 """
@@ -229,78 +437,370 @@ Reputation Rating Service interface definition
 """        
 class RatingService(ReputationService):
 
-	"""
-	Input: List of dicts with the key-value pairs for the attributes: "from","type","to","value","weight","time"
-	Output: 0 on success, integer error code on error 
-	"""
-	@abc.abstractmethod
-	def put_ratings(self,ratings):
-		pass
+    """
+    In-memory rating store.
 
-	"""
-	Input: filter as dict of the following:
-		since - starting time inclusively
-		until - ending time inclusively
-		ids - list of ids to retrieve incoming AND outgoing ratings BOTH
-		from - list of ids to retrieve outgoing ratings ONLY (TODO later)
-		to - list of ids to retrieve incoming ratings ONLY (TODO later)
-	Output: tuple of the pair:
-		0 on success, integer error code on error
-		List of dicts with the key-value pairs for the attributes: "from","type","to","value","weight","time"
-	"""
-	@abc.abstractmethod
-	def get_ratings(self,filter):
-		pass
+    Stores ratings as a list of normalized dicts with keys:
+      from, type, to, value, weight, time
 
-	"""
-	Input: None
-	Output: 0 on success, integer error code on error 
-	"""
-	@abc.abstractmethod
-	def clear_ratings(self):
-		pass
-		
+    Time is stored as pandas.Timestamp (UTC if timezone-naive inputs are provided).
+    """
+
+    # Error codes
+    ERR_NOT_A_DICT = 1
+    ERR_NOT_A_LIST = 2
+    ERR_INVALID_TYPE = 3
+    ERR_INVALID_VALUE = 4
+
+    def __init__(self) -> None:
+        # Parameters (basic baseline; you can extend later)
+        self._params: Dict[str, Any] = {
+            "default_reputation": 0.5,
+            "conservatism": 0.1,
+            "precision": 1,
+        }
+        self._allowed_keys = set(self._params.keys())
+
+        # Ratings storage
+        self._ratings: List[Dict[str, Any]] = []
+
+    # -------------------------
+    # ReputationService methods
+    # -------------------------
+    def set_parameters(self, parameters: Dict[str, Any]) -> int:
+        if not isinstance(parameters, dict):
+            return self.ERR_NOT_A_DICT
+
+        for k in parameters.keys():
+            if k not in self._allowed_keys:
+                return self.ERR_INVALID_VALUE
+
+        # Minimal validation (can be expanded)
+        for k, v in parameters.items():
+            if k in {"default_reputation", "conservatism"}:
+                if not isinstance(v, (int, float)):
+                    return self.ERR_INVALID_TYPE
+            if k == "precision":
+                if not isinstance(v, int) or v < 0:
+                    return self.ERR_INVALID_VALUE
+
+            self._params[k] = v
+
+        return 0
+
+    def get_parameters(self) -> Dict[str, Any]:
+        return deepcopy(self._params)
+
+    # -------------------------
+    # RatingService methods
+    # -------------------------
+    def put_ratings(self, ratings: List[Dict[str, Any]]) -> int:
+        """
+        ratings: list of dicts with keys:
+          from (str), type (str), to (str), value (number), weight (number), time (datetime-like)
+        """
+        if not isinstance(ratings, list):
+            return self.ERR_NOT_A_LIST
+
+        normalized: List[Dict[str, Any]] = []
+
+        for item in ratings:
+            if not isinstance(item, dict):
+                return self.ERR_INVALID_TYPE
+
+            # Required keys
+            required = {"from", "type", "to", "value", "weight", "time"}
+            if not required.issubset(item.keys()):
+                return self.ERR_INVALID_VALUE
+
+            frm = item["from"]
+            typ = item["type"]
+            to = item["to"]
+            val = item["value"]
+            wgt = item["weight"]
+            t = item["time"]
+
+            if not isinstance(frm, str) or not isinstance(to, str) or not isinstance(typ, str):
+                return self.ERR_INVALID_TYPE
+            if not isinstance(val, (int, float)) or not isinstance(wgt, (int, float)):
+                return self.ERR_INVALID_TYPE
+
+            # Normalize time to pandas Timestamp (UTC)
+            ts = pd.to_datetime(t, utc=True, errors="coerce")
+            if pd.isna(ts):
+                return self.ERR_INVALID_VALUE
+
+            normalized.append({
+                "from": frm,
+                "type": typ,
+                "to": to,
+                "value": float(val),
+                "weight": float(wgt),
+                "time": ts,
+            })
+
+        # Append (no dedupe yet; we can add transactionID later if needed)
+        self._ratings.extend(normalized)
+        return 0
+
+    def get_ratings(self, filter: Dict[str, Any]) -> Tuple[int, List[Dict[str, Any]]]:
+        """
+        filter:
+          since: datetime-like (inclusive)
+          until: datetime-like (inclusive)
+          ids: list[str] (incoming OR outgoing)
+          from: list[str] (outgoing only)
+          to: list[str] (incoming only)
+        """
+        if not isinstance(filter, dict):
+            return self.ERR_NOT_A_DICT, []
+
+        # Parse times (optional)
+        since = filter.get("since", None)
+        until = filter.get("until", None)
+
+        since_ts = pd.to_datetime(since, utc=True, errors="coerce") if since is not None else None
+        until_ts = pd.to_datetime(until, utc=True, errors="coerce") if until is not None else None
+
+        if since is not None and pd.isna(since_ts):
+            return self.ERR_INVALID_VALUE, []
+        if until is not None and pd.isna(until_ts):
+            return self.ERR_INVALID_VALUE, []
+
+        # Parse ID filters (optional)
+        ids = filter.get("ids", None)
+        from_ids = filter.get("from", None)
+        to_ids = filter.get("to", None)
+
+        if ids is not None and (not isinstance(ids, list) or any(not isinstance(x, str) for x in ids)):
+            return self.ERR_INVALID_TYPE, []
+        if from_ids is not None and (not isinstance(from_ids, list) or any(not isinstance(x, str) for x in from_ids)):
+            return self.ERR_INVALID_TYPE, []
+        if to_ids is not None and (not isinstance(to_ids, list) or any(not isinstance(x, str) for x in to_ids)):
+            return self.ERR_INVALID_TYPE, []
+
+        # Filter ratings
+        out: List[Dict[str, Any]] = []
+        for r in self._ratings:
+            t = r["time"]
+
+            if since_ts is not None and t < since_ts:
+                continue
+            if until_ts is not None and t > until_ts:
+                continue
+
+            # ids => incoming or outgoing
+            if ids is not None:
+                if (r["from"] not in ids) and (r["to"] not in ids):
+                    continue
+
+            # from => outgoing only
+            if from_ids is not None:
+                if r["from"] not in from_ids:
+                    continue
+
+            # to => incoming only
+            if to_ids is not None:
+                if r["to"] not in to_ids:
+                    continue
+
+            out.append(r)
+
+        # Return copies with time serialized to ISO if you prefer; for now keep Timestamp
+        # (keeping Timestamp is more useful for downstream bucketing)
+        return 0, [dict(x) for x in out]
+
+    def clear_ratings(self) -> int:
+        self._ratings.clear()
+        return 0
+
 """
 Reputation Ranking Service interface definition
 """        
 class RankingService(ReputationService):
 
-	"""
-	Input: Date to update the ranks for
-	Output: 0 on success, integer error code on error 
-	"""
-	@abc.abstractmethod
-	def update_ranks(self,date):
-		pass
+    """
+    A minimal, deterministic storage-backed ranking service.
 
-	"""
-	Input: Date and list of dicts with two key-value pairs for "id" and "rank" 
-	Output: 0 on success, integer error code on error 
-	"""
-	@abc.abstractmethod
-	def put_ranks(self,date,ranks):
-		pass
+    Stores ranks by date:
+      self._ranks_by_date[date_key] = {id: rank, ...}
 
-	"""
-	Input: filter as dict of the following:
-		date - date to provide the ranks
-		ids - list of ids to retrieve the ranks
-	Output: tuple of the pair:
-		0 on success, integer error code on error
-		List of dicts with the two key-value pairs for "id" and "rank"
-	"""
-	@abc.abstractmethod
-	def get_ranks(self,filter):
-		pass
+    This is intentionally decoupled from the computation logic:
+    - update_ranks(date) will be wired to the algorithm later
+    - put/get/clear are ready now
+    """
 
-	"""
-	Input: None
-	Output: 0 on success, integer error code on error 
-	"""
-	@abc.abstractmethod
-	def clear_ranks(self):
-		pass
+    # Error codes
+    ERR_NOT_A_DICT = 1
+    ERR_UNKNOWN_KEY = 2
+    ERR_INVALID_TYPE = 3
+    ERR_INVALID_VALUE = 4
+    ERR_NOT_IMPLEMENTED = 5
+    ERR_NOT_FOUND = 6
 
-	@abc.abstractmethod
-	def get_ranks_dict(self,filter):
-		pass
+    def __init__(self) -> None:
+        # Parameter store (same idea as earlier); defaults can be extended later
+        self._params: Dict[str, Any] = {
+            "default_reputation": 0.5,
+            "conservatism": 0.1,
+            "precision": 1,
+        }
+        self._allowed_keys = set(self._params.keys())
+
+        # Rank storage
+        self._ranks_by_date: Dict[date_type, Dict[str, float]] = {}
+
+    # -------------------------
+    # ReputationService methods
+    # -------------------------
+    def set_parameters(self, parameters: Dict[str, Any]) -> int:
+        if not isinstance(parameters, dict):
+            return self.ERR_NOT_A_DICT
+
+        for k in parameters.keys():
+            if k not in self._allowed_keys:
+                return self.ERR_UNKNOWN_KEY
+
+        for k, v in parameters.items():
+            code = self._validate_param(k, v)
+            if code != 0:
+                return code
+            self._params[k] = v
+
+        return 0
+
+    def get_parameters(self) -> Dict[str, Any]:
+        return deepcopy(self._params)
+
+    # -------------------------
+    # RankingService methods
+    # -------------------------
+    def update_ranks(self, date) -> int:
+        """
+        Placeholder until computation is implemented.
+        Later this will:
+          - run the liquid-rank update for the period ending at `date`
+          - store results into self._ranks_by_date[date]
+        """
+        _ = self._coerce_date(date)  # validate date
+        return self.ERR_NOT_IMPLEMENTED
+
+    def put_ranks(self, date, ranks) -> int:
+        """
+        Store ranks for a given date.
+        ranks must be: [{"id": <str>, "rank": <number>}, ...]
+        """
+        d = self._coerce_date(date)
+
+        if not isinstance(ranks, list):
+            return self.ERR_INVALID_TYPE
+
+        bucket: Dict[str, float] = {}
+        for item in ranks:
+            if not isinstance(item, dict):
+                return self.ERR_INVALID_TYPE
+            if "id" not in item or "rank" not in item:
+                return self.ERR_INVALID_VALUE
+
+            rid = item["id"]
+            rnk = item["rank"]
+
+            if not isinstance(rid, str):
+                return self.ERR_INVALID_TYPE
+            if not isinstance(rnk, (int, float)):
+                return self.ERR_INVALID_TYPE
+
+            bucket[rid] = float(rnk)
+
+        self._ranks_by_date[d] = bucket
+        return 0
+
+    def get_ranks(self, filter) -> Tuple[int, List[Dict[str, Any]]]:
+        """
+        filter:
+          - date (required)
+          - ids (optional list[str])
+        """
+        if not isinstance(filter, dict):
+            return self.ERR_NOT_A_DICT, []
+
+        if "date" not in filter:
+            return self.ERR_INVALID_VALUE, []
+
+        d = self._coerce_date(filter["date"])
+
+        if d not in self._ranks_by_date:
+            return self.ERR_NOT_FOUND, []
+
+        ranks_dict = self._ranks_by_date[d]
+
+        ids = filter.get("ids", None)
+        if ids is None:
+            # Return all ranks
+            out = [{"id": k, "rank": v} for k, v in ranks_dict.items()]
+            return 0, out
+
+        if not isinstance(ids, list) or any(not isinstance(x, str) for x in ids):
+            return self.ERR_INVALID_TYPE, []
+
+        out = [{"id": i, "rank": ranks_dict[i]} for i in ids if i in ranks_dict]
+        return 0, out
+
+    def clear_ranks(self) -> int:
+        ### Clears ranks. Best to avoid this unless ending one simulation and starting another.
+        self._ranks_by_date.clear()
+        return 0
+
+    def get_ranks_dict(self, filter) -> Tuple[int, Dict[str, float]]:
+        """
+        Same filter as get_ranks, but returns a dict {id: rank}.
+        """
+        code, rows = self.get_ranks(filter)
+        if code != 0:
+            return code, {}
+        return 0, {row["id"]: float(row["rank"]) for row in rows}
+
+    # -------------------------
+    # Helpers
+    # -------------------------
+    def _coerce_date(self, d: Union[date_type, datetime, str]) -> date_type:
+        """
+        Accepts:
+          - datetime.date
+          - datetime.datetime
+          - ISO date string (YYYY-MM-DD) or datetime string parseable by pandas
+        Returns: datetime.date
+        """
+        if isinstance(d, date_type) and not isinstance(d, datetime):
+            return d
+        if isinstance(d, datetime):
+            return d.date()
+        if isinstance(d, str):
+            # robust parsing
+            parsed = pd.to_datetime(d, utc=True, errors="raise")
+            return parsed.date()
+        raise TypeError("date must be datetime.date, datetime.datetime, or parseable string")
+
+    def _validate_param(self, key: str, value: Any) -> int:
+        if key == "default_reputation":
+            if not isinstance(value, (int, float)):
+                return self.ERR_INVALID_TYPE
+            if not (0.0 <= float(value) <= 1.0):
+                return self.ERR_INVALID_VALUE
+            return 0
+
+        if key == "conservatism":
+            if not isinstance(value, (int, float)):
+                return self.ERR_INVALID_TYPE
+            if not (0.0 <= float(value) <= 1.0):
+                return self.ERR_INVALID_VALUE
+            return 0
+
+        if key == "precision":
+            if not isinstance(value, int):
+                return self.ERR_INVALID_TYPE
+            if value < 0:
+                return self.ERR_INVALID_VALUE
+            return 0
+
+        return self.ERR_UNKNOWN_KEY
