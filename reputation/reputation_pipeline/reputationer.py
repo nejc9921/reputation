@@ -196,7 +196,7 @@ class ReputationEngine:
     
     
     def _step_one_day(self, date, group):
-
+        assert self.reputation01 is not self.reputation
         vals = group["value"].astype(float)
         vmin, vmax = vals.min(), vals.max()
         
@@ -253,16 +253,9 @@ class ReputationEngine:
         # 6. Update reputations if new addresses appeared
         if self.multiple_reputations:
             self.reputation01 = update_reputation(
-            self.reputation01,
-            array1,
-            default_reputation=self.default_rep,
-            spendings=0)
+            self.reputation01, array1,default_reputation=self.default_rep,spendings=0)
             
-        self.reputation = update_reputation(
-            self.reputation,
-            array1,
-            default_reputation=self.default_rep,
-            spendings=0)
+        self.reputation = update_reputation(self.reputation,array1,default_reputation=self.default_rep,spendings=0)
 
         # 7. Compute differential
         ### Note this differential is just F(τ,i,j,k) * R_g(t-1,j) * W(τ,i,j,k) , for now. We still need to multiply by H_k and divide by:
